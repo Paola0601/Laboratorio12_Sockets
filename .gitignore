@@ -1,0 +1,13 @@
+# Ejecutables binarios locales
+servidor
+cliente
+
+# Datos binarios de prueba gigantescos
+recibidos/*
+archivos_prueba/*
+!recibidos/.gitkeep
+!archivos_prueba/.gitkeep
+
+# Temporales de sistema
+*.o
+.DS_Store
