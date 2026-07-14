@@ -14,16 +14,18 @@ void *atender_hilo_cliente(void *arg) {
     int socket_cliente = *(int *)arg;
     free(arg);
 
-    BloqueArchivo bloque;
+    MensajeRed mensaje;
     
-    while (recv(socket_cliente, &bloque, sizeof(BloqueArchivo), MSG_WAITALL) > 0) {
-        pthread_mutex_lock(&cerrojo_archivo);
-        
-        fseek(archivo_destino, bloque.offset, SEEK_SET);
-        fwrite(bloque.datos, 1, bloque.size, archivo_destino);
-        fflush(archivo_destino);
-        
-        pthread_mutex_unlock(&cerrojo_archivo);
+    while (recv(socket_cliente, &mensaje, sizeof(MensajeRed), MSG_WAITALL) > 0) {
+        if (mensaje.tipo_mensaje == TIPO_DATOS) {
+            pthread_mutex_lock(&cerrojo_archivo);
+            if (archivo_destino != NULL) {
+                fseek(archivo_destino, mensaje.offset, SEEK_SET);
+                fwrite(mensaje.datos, 1, mensaje.size, archivo_destino);
+                fflush(archivo_destino);
+            }
+            pthread_mutex_unlock(&cerrojo_archivo);
+        }
     }
 
     close(socket_cliente);
@@ -36,18 +38,7 @@ int main() {
     struct sockaddr_in direccion_cliente;
     socklen_t tamano_cliente = sizeof(direccion_cliente);
 
-    archivo_destino = fopen("recibidos/archivo_final.bin", "wb");
-    if (!archivo_destino) {
-        perror("[-] Error: Asegurate de crear la carpeta 'recibidos'");
-        return EXIT_FAILURE;
-    }
-
     socket_servidor = socket(AF_INET, SOCK_STREAM, 0);
-    if (socket_servidor < 0) {
-        perror("[-] Error al crear el socket");
-        return EXIT_FAILURE;
-    }
-
     int opcion = 1;
     setsockopt(socket_servidor, SOL_SOCKET, SO_REUSEADDR, &opcion, sizeof(opcion));
 
@@ -57,36 +48,48 @@ int main() {
 
     if (bind(socket_servidor, (struct sockaddr *)&direccion_servidor, sizeof(direccion_servidor)) < 0) {
         perror("[-] Error en bind");
-        close(socket_servidor);
-        return EXIT_FAILURE;
+        return 1;
     }
-
-    if (listen(socket_servidor, 20) < 0) {
-        perror("[-] Error en listen");
-        close(socket_servidor);
-        return EXIT_FAILURE;
-    }
-
-    printf("[+] Servidor paralelo activo en el puerto %d...\n", PUERTO);
+    listen(socket_servidor, 20);
+    printf("[+] Servidor Dinámico Inteligente activo en el puerto %d...\n", PUERTO);
 
     while (1) {
         int cliente_fd = accept(socket_servidor, (struct sockaddr *)&direccion_cliente, &tamano_cliente);
         if (cliente_fd < 0) continue;
 
-        int *socket_hilo = malloc(sizeof(int));
-        *socket_hilo = cliente_fd;
-
-        pthread_t id_hilo;
-        if (pthread_create(&id_hilo, NULL, atender_hilo_cliente, socket_hilo) == 0) {
+        // Leer el primer mensaje para verificar si trae los metadatos del archivo
+        MensajeRed primer_msg;
+        if (recv(cliente_fd, &primer_msg, sizeof(MensajeRed), MSG_WAITALL) > 0) {
+            if (primer_msg.tipo_mensaje == TIPO_METADATA) {
+                pthread_mutex_lock(&cerrojo_archivo);
+                if (archivo_destino == NULL) {
+                    char ruta_final[512];
+                    snprintf(ruta_final, sizeof(ruta_final), "recibidos/%s", primer_msg.nombre_archivo);
+                    archivo_destino = fopen(ruta_final, "wb");
+                    printf("[+] Reconstruyendo archivo detectado: %s\n", ruta_final);
+                }
+                pthread_mutex_unlock(&cerrojo_archivo);
+            }
+            
+            // Si el mensaje es de datos o es una subconexión de hilo, procesarla
+            int *socket_hilo = malloc(sizeof(int));
+            *socket_hilo = cliente_fd;
+            
+            // Si el primer mensaje ya traía datos en una subconexión, lo forzamos a procesar
+            pthread_t id_hilo;
+            pthread_create(&id_hilo, NULL, atender_hilo_cliente, socket_hilo);
             pthread_detach(id_hilo);
-        } else {
-            close(cliente_fd);
-            free(socket_hilo);
+
+            // Inyectar manualmente el bloque si ya venía con datos
+            if (primer_msg.tipo_mensaje == TIPO_DATOS) {
+                pthread_mutex_lock(&cerrojo_archivo);
+                fseek(archivo_destino, primer_msg.offset, SEEK_SET);
+                fwrite(primer_msg.datos, 1, primer_msg.size, archivo_destino);
+                fflush(archivo_destino);
+                pthread_mutex_unlock(&cerrojo_archivo);
+            }
         }
     }
 
-    fclose(archivo_destino);
-    close(socket_servidor);
-    pthread_mutex_destroy(&cerrojo_archivo);
-    return EXIT_SUCCESS;
+    return 0;
 }
