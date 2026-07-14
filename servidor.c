@@ -9,87 +9,114 @@
 
 pthread_mutex_t cerrojo_archivo = PTHREAD_MUTEX_INITIALIZER;
 FILE *archivo_destino = NULL;
+int hilos_terminados = 0;
 
-void *atender_hilo_cliente(void *arg) {
+void registrar_fin_hilo(void) {
+    pthread_mutex_lock(&cerrojo_archivo);
+    hilos_terminados++;
+    printf("Seccion recibida (%d de %d).\n", hilos_terminados, N_THREADS);
+    if (hilos_terminados == N_THREADS && archivo_destino != NULL) {
+        fclose(archivo_destino);
+        archivo_destino = NULL;
+        printf("Archivo reconstruido completamente.\n");
+    }
+    pthread_mutex_unlock(&cerrojo_archivo);
+}
+
+int recibir_completo(int socket_fd, void *datos, size_t cantidad) {
+    char *p = datos;
+    while (cantidad > 0) {
+        ssize_t recibidos = recv(socket_fd, p, cantidad, 0);
+        if (recibidos <= 0) return -1;
+        p += recibidos;
+        cantidad -= recibidos;
+    }
+    return 0;
+}
+
+void escribir_bloque(MensajeRed *mensaje) {
+    if (mensaje->size < 0 || mensaje->size > BUFFER_SIZE) return;
+    pthread_mutex_lock(&cerrojo_archivo);
+    if (archivo_destino != NULL) {
+        fseek(archivo_destino, mensaje->offset, SEEK_SET);
+        fwrite(mensaje->datos, 1, mensaje->size, archivo_destino);
+    }
+    pthread_mutex_unlock(&cerrojo_archivo);
+}
+
+void *atender_cliente(void *arg) {
     int socket_cliente = *(int *)arg;
-    free(arg);
-
     MensajeRed mensaje;
-    
-    while (recv(socket_cliente, &mensaje, sizeof(MensajeRed), MSG_WAITALL) > 0) {
+    free(arg);
+    while (recibir_completo(socket_cliente, &mensaje, sizeof(mensaje)) == 0) {
         if (mensaje.tipo_mensaje == TIPO_DATOS) {
-            pthread_mutex_lock(&cerrojo_archivo);
-            if (archivo_destino != NULL) {
-                fseek(archivo_destino, mensaje.offset, SEEK_SET);
-                fwrite(mensaje.datos, 1, mensaje.size, archivo_destino);
-                fflush(archivo_destino);
-            }
-            pthread_mutex_unlock(&cerrojo_archivo);
+            escribir_bloque(&mensaje);
+        } else if (mensaje.tipo_mensaje == TIPO_FIN_HILO) {
+            registrar_fin_hilo();
+            break;
         }
     }
-
     close(socket_cliente);
     return NULL;
 }
 
-int main() {
-    int socket_servidor;
-    struct sockaddr_in direccion_servidor;
-    struct sockaddr_in direccion_cliente;
-    socklen_t tamano_cliente = sizeof(direccion_cliente);
+int main(void) {
+    int socket_servidor = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in servidor = {0}, cliente;
+    socklen_t tamano_cliente = sizeof(cliente);
+    if (socket_servidor < 0) return 1;
 
-    socket_servidor = socket(AF_INET, SOCK_STREAM, 0);
     int opcion = 1;
     setsockopt(socket_servidor, SOL_SOCKET, SO_REUSEADDR, &opcion, sizeof(opcion));
-
-    direccion_servidor.sin_family = AF_INET;
-    direccion_servidor.sin_addr.s_addr = INADDR_ANY;
-    direccion_servidor.sin_port = htons(PUERTO);
-
-    if (bind(socket_servidor, (struct sockaddr *)&direccion_servidor, sizeof(direccion_servidor)) < 0) {
-        perror("[-] Error en bind");
-        return 1;
+    servidor.sin_family = AF_INET;
+    servidor.sin_addr.s_addr = INADDR_ANY;
+    servidor.sin_port = htons(PUERTO);
+    if (bind(socket_servidor, (struct sockaddr *)&servidor, sizeof(servidor)) < 0) {
+        perror("Error en bind"); close(socket_servidor); return 1;
     }
-    listen(socket_servidor, 20);
-    printf("[+] Servidor Dinámico Inteligente activo en el puerto %d...\n", PUERTO);
+    if (listen(socket_servidor, 20) < 0) return 1;
+    printf("Servidor activo en el puerto %d.\n", PUERTO);
 
     while (1) {
-        int cliente_fd = accept(socket_servidor, (struct sockaddr *)&direccion_cliente, &tamano_cliente);
+        int cliente_fd = accept(socket_servidor, (struct sockaddr *)&cliente, &tamano_cliente);
         if (cliente_fd < 0) continue;
-
-        // Leer el primer mensaje para verificar si trae los metadatos del archivo
-        MensajeRed primer_msg;
-        if (recv(cliente_fd, &primer_msg, sizeof(MensajeRed), MSG_WAITALL) > 0) {
-            if (primer_msg.tipo_mensaje == TIPO_METADATA) {
-                pthread_mutex_lock(&cerrojo_archivo);
-                if (archivo_destino == NULL) {
-                    char ruta_final[512];
-                    snprintf(ruta_final, sizeof(ruta_final), "recibidos/%s", primer_msg.nombre_archivo);
-                    archivo_destino = fopen(ruta_final, "wb");
-                    printf("[+] Reconstruyendo archivo detectado: %s\n", ruta_final);
-                }
-                pthread_mutex_unlock(&cerrojo_archivo);
-            }
-            
-            // Si el mensaje es de datos o es una subconexión de hilo, procesarla
-            int *socket_hilo = malloc(sizeof(int));
-            *socket_hilo = cliente_fd;
-            
-            // Si el primer mensaje ya traía datos en una subconexión, lo forzamos a procesar
-            pthread_t id_hilo;
-            pthread_create(&id_hilo, NULL, atender_hilo_cliente, socket_hilo);
-            pthread_detach(id_hilo);
-
-            // Inyectar manualmente el bloque si ya venía con datos
-            if (primer_msg.tipo_mensaje == TIPO_DATOS) {
-                pthread_mutex_lock(&cerrojo_archivo);
-                fseek(archivo_destino, primer_msg.offset, SEEK_SET);
-                fwrite(primer_msg.datos, 1, primer_msg.size, archivo_destino);
-                fflush(archivo_destino);
-                pthread_mutex_unlock(&cerrojo_archivo);
-            }
+        MensajeRed primero;
+        if (recibir_completo(cliente_fd, &primero, sizeof(primero)) < 0) {
+            close(cliente_fd); continue;
         }
-    }
 
-    return 0;
+        if (primero.tipo_mensaje == TIPO_METADATA) {
+            const char *nombre = strrchr(primero.nombre_archivo, '/');
+            nombre = nombre == NULL ? primero.nombre_archivo : nombre + 1;
+            pthread_mutex_lock(&cerrojo_archivo);
+            if (archivo_destino != NULL) fclose(archivo_destino);
+            char ruta[512];
+            snprintf(ruta, sizeof(ruta), "recibidos/%s", nombre);
+            archivo_destino = fopen(ruta, "wb");
+            hilos_terminados = 0;
+            if (archivo_destino != NULL && primero.tamano_archivo > 0) {
+                fseek(archivo_destino, primero.tamano_archivo - 1, SEEK_SET);
+                fputc('\0', archivo_destino);
+                fflush(archivo_destino);
+            }
+            printf("Reconstruyendo: %s (%ld bytes)\n", ruta, primero.tamano_archivo);
+            pthread_mutex_unlock(&cerrojo_archivo);
+            close(cliente_fd);
+            continue;
+        }
+
+        if (primero.tipo_mensaje == TIPO_DATOS) {
+            escribir_bloque(&primero);
+        } else if (primero.tipo_mensaje == TIPO_FIN_HILO) {
+            registrar_fin_hilo();
+            close(cliente_fd);
+            continue;
+        }
+        int *socket_hilo = malloc(sizeof(int));
+        pthread_t hilo;
+        if (socket_hilo == NULL) { close(cliente_fd); continue; }
+        *socket_hilo = cliente_fd;
+        pthread_create(&hilo, NULL, atender_cliente, socket_hilo);
+        pthread_detach(hilo);
+    }
 }
